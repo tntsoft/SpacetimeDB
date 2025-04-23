@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::{fmt, io};
 
+use crate::auth::EcKeyPair;
 use spacetimedb_lib::ConnectionId;
 use spacetimedb_paths::cli::{ConfigDir, PrivKeyPath, PubKeyPath};
 use spacetimedb_paths::server::{ConfigToml, MetadataTomlPath};
@@ -132,6 +133,9 @@ impl CertificateAuthority {
 
     pub fn get_or_create_keys(&self) -> anyhow::Result<crate::auth::JwtKeys> {
         crate::auth::get_or_create_keys(self)
+    }
+    pub fn get_or_create_keys2(&self) -> anyhow::Result<EcKeyPair> {
+        crate::auth::get_or_create_keys2(self)
     }
 }
 

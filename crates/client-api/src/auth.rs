@@ -260,6 +260,13 @@ mod tests {
     }
 }
 
+pub async fn validate_token<S: NodeDelegate>(
+    state: &S,
+    token: &str,
+) -> Result<SpacetimeIdentityClaims, TokenValidationError> {
+    state.jwt_auth_provider().validator().validate_token(token).await
+}
+
 pub struct SpacetimeAuthHeader {
     auth: Option<SpacetimeAuth>,
 }
@@ -272,10 +279,7 @@ impl<S: NodeDelegate + Send + Sync> axum::extract::FromRequestParts<S> for Space
             return Ok(Self { auth: None });
         };
 
-        let claims = state
-            .jwt_auth_provider()
-            .validator()
-            .validate_token(&creds.token)
+        let claims = validate_token(state, &creds.token)
             .await
             .map_err(AuthorizationRejection::Custom)?;
 
