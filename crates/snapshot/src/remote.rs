@@ -127,10 +127,32 @@ pub async fn synchronize_snapshot(
     snapshots_dir: SnapshotsPath,
     snapshot: Snapshot,
 ) -> Result<Stats> {
+    run_fetcher(provider, snapshots_dir, snapshot, false).await
+}
+
+/// Verifies the integrity of the objects referenced from [`Snapshot`],
+/// in constant memory.
+///
+/// Like [`synchronize_snapshot`], but doesn't modify the local storage.
+/// Usually, a local [`BlobProvider`] like [`DirTrie`] should be provided.
+pub async fn verify_snapshot(
+    provider: impl BlobProvider + 'static,
+    snapshots_dir: SnapshotsPath,
+    snapshot: Snapshot,
+) -> Result<Stats> {
+    run_fetcher(provider, snapshots_dir, snapshot, true).await
+}
+
+async fn run_fetcher(
+    provider: impl BlobProvider + 'static,
+    snapshots_dir: SnapshotsPath,
+    snapshot: Snapshot,
+    dry_run: bool,
+) -> Result<Stats> {
     spawn_blocking(|| SnapshotFetcher::create(provider, snapshots_dir, snapshot))
         .await
         .unwrap()?
-        .run()
+        .run(dry_run)
         .await
 }
 
@@ -165,6 +187,7 @@ struct SnapshotFetcher<P> {
     object_repo: Arc<DirTrie>,
     parent_repo: Option<Arc<DirTrie>>,
     provider: P,
+    dry_run: bool,
 
     stats: StatsInner,
 
@@ -202,12 +225,15 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
             object_repo: Arc::new(object_repo),
             parent_repo: parent_repo.map(Arc::new),
             provider,
+            dry_run: false,
             stats: <_>::default(),
             lock,
         })
     }
 
-    async fn run(self) -> Result<Stats> {
+    async fn run(mut self, dry_run: bool) -> Result<Stats> {
+        self.dry_run = dry_run;
+
         let snapshot_bsatn = serialize_bsatn(ObjectType::Snapshot, &self.snapshot)?;
         let snapshot_hash = blake3::hash(&snapshot_bsatn);
         let snapshot_file_path = self.dir.snapshot_file(self.snapshot.tx_offset);
@@ -237,14 +263,13 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
         tokio::try_join!(self.fetch_blobs(), self.fetch_pages())?;
 
         // Success. Write out the snapshot file.
-        atomically(snapshot_file_path.0, |out| async {
+        atomically((!self.dry_run).then_some(snapshot_file_path.0), |out| async {
             let mut out = BufWriter::new(out);
             out.write_all(snapshot_hash.as_bytes()).await?;
             out.write_all(&snapshot_bsatn).await?;
             out.flush().await?;
-            out.into_inner().sync_all().await?;
 
-            Ok(())
+            Ok(out.into_inner())
         })
         .await?;
 
@@ -284,7 +309,7 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
         let Some(dst_path) = self.object_file_path(hash).await? else {
             return Ok(());
         };
-        atomically(dst_path, |out| async move {
+        atomically((!self.dry_run).then_some(dst_path), |out| async move {
             let mut out = BufWriter::new(out);
             let mut src = self.provider.blob_reader(hash).await?;
             let compressed = src.fill_buf().await?.starts_with(&ZSTD_MAGIC_BYTES);
@@ -295,12 +320,11 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
             let mut hasher = blake3::Hasher::new();
             let computed_hash = if !compressed {
                 // If the input is uncompressed, just update the hasher as we go.
-                let mut out = InspectWriter::new(out, |chunk| {
+                let mut writer = InspectWriter::new(&mut out, |chunk| {
                     hasher.update(chunk);
                 });
-                tokio::io::copy_buf(&mut src, &mut out).await?;
-                out.flush().await?;
-                out.into_inner().into_inner().sync_all().await?;
+                tokio::io::copy_buf(&mut src, &mut writer).await?;
+                writer.flush().await?;
 
                 hasher.finalize()
             } else {
@@ -321,7 +345,6 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
                 });
                 tokio::io::copy(&mut src, &mut out).await?;
                 out.flush().await?;
-                out.into_inner().sync_all().await?;
 
                 drop(tx);
                 decompressor.await.unwrap()?
@@ -335,7 +358,7 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
                 });
             }
 
-            Ok(())
+            Ok(out.into_inner())
         })
         .await
         .inspect(|()| {
@@ -347,7 +370,8 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
         let Some(dst_path) = self.object_file_path(hash).await? else {
             return Ok(());
         };
-        atomically(dst_path, |out| async {
+        atomically((!self.dry_run).then_some(dst_path), |out| async {
+            let mut out = BufWriter::new(out);
             let mut src = self.provider.blob_reader(hash).await?;
             let compressed = src.fill_buf().await?.starts_with(&ZSTD_MAGIC_BYTES);
 
@@ -358,12 +382,11 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
             let page_buf = if !compressed {
                 // If the input is uncompressed, just copy all bytes to a buffer.
                 let mut page_buf = Vec::with_capacity(u16::MAX as usize + 1);
-                let mut out = InspectWriter::new(BufWriter::new(out), |chunk| {
+                let mut writer = InspectWriter::new(&mut out, |chunk| {
                     page_buf.extend_from_slice(chunk);
                 });
-                tokio::io::copy_buf(&mut src, &mut out).await?;
-                out.flush().await?;
-                out.into_inner().into_inner().sync_all().await?;
+                tokio::io::copy_buf(&mut src, &mut writer).await?;
+                writer.flush().await?;
 
                 page_buf
             } else {
@@ -377,19 +400,20 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
                     Ok::<_, io::Error>(page_buf)
                 });
 
-                let mut out = InspectWriter::new(BufWriter::new(out), |chunk| {
+                let mut writer = InspectWriter::new(&mut out, |chunk| {
                     let bytes = Bytes::copy_from_slice(chunk);
                     tx.send(Ok(bytes)).ok();
                 });
-                tokio::io::copy_buf(&mut src, &mut out).await?;
-                out.flush().await?;
-                out.into_inner().into_inner().sync_all().await?;
+                tokio::io::copy_buf(&mut src, &mut writer).await?;
+                writer.flush().await?;
 
                 drop(tx);
                 decompressor.await.unwrap()?
             };
 
-            self.verify_page(hash, &page_buf)
+            self.verify_page(hash, &page_buf)?;
+
+            Ok(out.into_inner())
         })
         .await
         .inspect(|()| {
@@ -426,10 +450,16 @@ impl<P: BlobProvider> SnapshotFetcher<P> {
 
         let object_repo = Arc::clone(&self.object_repo);
         let parent_repo = Arc::clone(parent);
-        spawn_blocking(move || object_repo.try_hardlink_from(&parent_repo, hash.as_bytes()))
-            .await
-            .unwrap()
-            .map_err(Into::into)
+        if !self.dry_run {
+            spawn_blocking(move || object_repo.try_hardlink_from(&parent_repo, hash.as_bytes()))
+                .await
+                .unwrap()
+                .map_err(Into::into)
+        } else {
+            let src_file = parent_repo.file_path(hash.as_bytes());
+            let meta = tokio::fs::metadata(src_file).await?;
+            Ok(meta.is_file())
+        }
     }
 
     fn verify_page(&self, expected_hash: blake3::Hash, buf: &[u8]) -> Result<()> {
@@ -496,27 +526,85 @@ impl AsyncWrite for AsyncHasher {
     }
 }
 
-async fn atomically<F, Fut>(file_path: PathBuf, f: F) -> Result<()>
+/// The [`AsyncWrite`] created by [`atomically`].
+///
+/// Either a temporary file that is being renamed atomically if and when the
+/// closure returns successfully,
+/// or a [`tokio::io::Sink`] that discards all data written to it (used for
+/// [`verify_snapshot`]).
+enum AtomicWriter {
+    File(fs::File),
+    Null(tokio::io::Sink),
+}
+
+impl AtomicWriter {
+    async fn sync_all(&self) -> io::Result<()> {
+        if let Self::File(file) = self {
+            file.sync_all().await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl AsyncWrite for AtomicWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, io::Error>> {
+        match self.get_mut() {
+            Self::File(file) => Pin::new(file).poll_write(cx, buf),
+            Self::Null(sink) => Pin::new(sink).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
+        match self.get_mut() {
+            Self::File(file) => Pin::new(file).poll_flush(cx),
+            Self::Null(sink) => Pin::new(sink).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
+        match self.get_mut() {
+            Self::File(file) => Pin::new(file).poll_shutdown(cx),
+            Self::Null(sink) => Pin::new(sink).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn atomically<F, Fut>(file_path: Option<PathBuf>, f: F) -> Result<()>
 where
-    F: FnOnce(fs::File) -> Fut,
-    Fut: Future<Output = Result<()>>,
+    F: FnOnce(AtomicWriter) -> Fut,
+    Fut: Future<Output = Result<AtomicWriter>>,
 {
-    let dir = file_path.parent().expect("file not in a directory").to_owned();
-    fs::create_dir_all(&dir).await?;
-    let (tmp_file, tmp_out) = spawn_blocking(move || {
-        let tmp = NamedTempFile::new_in(dir)?;
-        let out = tmp.reopen()?;
-        Ok::<_, io::Error>((tmp, out))
-    })
-    .await
-    .unwrap()?;
+    match file_path {
+        Some(file_path) => {
+            let dir = file_path.parent().expect("file not in a directory").to_owned();
+            fs::create_dir_all(&dir).await?;
+            let (tmp_file, tmp_out) = spawn_blocking(move || {
+                let tmp = NamedTempFile::new_in(dir)?;
+                let out = tmp.reopen()?;
+                Ok::<_, io::Error>((tmp, out))
+            })
+            .await
+            .unwrap()?;
 
-    f(fs::File::from_std(tmp_out)).await?;
+            let mut file = AtomicWriter::File(fs::File::from_std(tmp_out));
+            file = f(file).await?;
+            file.sync_all().await?;
 
-    spawn_blocking(|| tmp_file.persist(file_path))
-        .await
-        .unwrap()
-        .map_err(|e| e.error)?;
+            spawn_blocking(|| tmp_file.persist(file_path))
+                .await
+                .unwrap()
+                .map_err(|e| e.error)?;
+        }
+
+        None => {
+            f(AtomicWriter::Null(tokio::io::sink())).await?;
+        }
+    }
 
     Ok(())
 }
